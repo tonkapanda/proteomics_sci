@@ -1,20 +1,19 @@
+# 1. setup
 library(MOFA2)
 library(tidyverse)
 
+dir.create("results", showWarnings = FALSE)
 
-# section 1: load data
-
+# 2. load data
 prot_raw <- read_tsv("human_proteomics.txt")
-meta <- read_tsv("human_proteomics_meta.txt")
+meta     <- read_tsv("human_proteomics_meta.txt")
 
 cat("proteins:", nrow(prot_raw), "| samples:", ncol(prot_raw) - 1, "\n")
-cat("cohorts:", paste(unique(meta$Cohort), collapse = ", "), "\n")
-cat("tissues:", paste(unique(meta$Tissue), collapse = ", "), "\n")
+cat("cohorts:",  paste(unique(meta$Cohort),    collapse = ", "), "\n")
+cat("tissues:",  paste(unique(meta$Tissue),    collapse = ", "), "\n")
 cat("timepoints:", paste(sort(unique(meta$Timepoint)), collapse = ", "), "\n")
 
-
-# section 2: prepare matrices
-
+# 3. long-format join and qc filter
 prot_long <- prot_raw |>
   pivot_longer(-Gene, names_to = "Sample", values_to = "Abundance") |>
   left_join(
@@ -23,7 +22,7 @@ prot_long <- prot_raw |>
     by = "Sample"
   )
 
-# exclude technical QC controls, keep patients and uninjured controls
+# drop technical qc controls
 discovery_samples <- meta |>
   filter(!str_detect(Sample, "PositiveControl|NegativeControl")) |>
   pull(Sample)
@@ -31,87 +30,101 @@ discovery_samples <- meta |>
 prot_discovery <- prot_long |>
   filter(Sample %in% discovery_samples)
 
-# proteins x samples matrix for each biofluid
-csf_mat <- prot_discovery |>
-  filter(Tissue == "CSF") |>
-  select(Gene, Sample, Abundance) |>
-  pivot_wider(names_from = Sample, values_from = Abundance) |>
-  column_to_rownames("Gene") |>
-  as.matrix()
+# 4. build per-biofluid matrices
+# helper: pivot to proteins x samples matrix
+make_mat <- function(df, tissue) {
+  df |>
+    filter(Tissue == tissue) |>
+    select(Gene, Sample, Abundance) |>
+    pivot_wider(names_from = Sample, values_from = Abundance) |>
+    column_to_rownames("Gene") |>
+    as.matrix()
+}
 
-serum_mat <- prot_discovery |>
-  filter(Tissue == "Serum") |>
-  select(Gene, Sample, Abundance) |>
-  pivot_wider(names_from = Sample, values_from = Abundance) |>
-  column_to_rownames("Gene") |>
-  as.matrix()
+csf_mat   <- make_mat(prot_discovery, "CSF")
+serum_mat <- make_mat(prot_discovery, "Serum")
 
-# keep proteins measured in at least 1/3 of samples, mirroring the paper
-csf_mat <- csf_mat[rowMeans(!is.na(csf_mat)) >= 1/3, ]
+# require protein measured in >= 1/3 of samples (mirrors paper)
+csf_mat   <- csf_mat[rowMeans(!is.na(csf_mat))   >= 1/3, ]
 serum_mat <- serum_mat[rowMeans(!is.na(serum_mat)) >= 1/3, ]
 
 cat("\nafter missingness filter:\n")
-cat("csf:", nrow(csf_mat), "proteins x", ncol(csf_mat), "samples\n")
+cat("csf:",   nrow(csf_mat),   "proteins x", ncol(csf_mat),   "samples\n")
 cat("serum:", nrow(serum_mat), "proteins x", ncol(serum_mat), "samples\n")
 
+# 5. train mofa2 models
+# helper: configure and run a single-view mofa model
+train_mofa <- function(mat, view_name, outfile, k = 10, seed = 42) {
+  obj <- create_mofa(setNames(list(mat), view_name))
 
-# section 3: train models
-# csf and serum have different sample sets so we run two separate models
+  d_opts <- get_default_data_options(obj)
+  d_opts$scale_views <- FALSE
 
-# csf model
-mofa_csf <- create_mofa(list(CSF = csf_mat))
+  m_opts <- get_default_model_options(obj)
+  m_opts$num_factors <- k
 
-data_opts_csf <- get_default_data_options(mofa_csf)
-data_opts_csf$scale_views <- FALSE
+  t_opts <- get_default_training_options(obj)
+  t_opts$convergence_mode <- "slow"
+  t_opts$seed <- seed
 
-model_opts_csf <- get_default_model_options(mofa_csf)
-model_opts_csf$num_factors <- 10
+  obj <- prepare_mofa(obj,
+                      data_options     = d_opts,
+                      model_options    = m_opts,
+                      training_options = t_opts)
 
-train_opts_csf <- get_default_training_options(mofa_csf)
-train_opts_csf$convergence_mode <- "slow"
-train_opts_csf$seed <- 42
+  run_mofa(obj, outfile = outfile, use_basilisk = TRUE)
+}
 
-mofa_csf <- prepare_mofa(mofa_csf,
-                         data_options = data_opts_csf,
-                         model_options = model_opts_csf,
-                         training_options = train_opts_csf)
+# csf and serum have disjoint sample sets, so separate models
+mofa_csf_trained   <- train_mofa(csf_mat,   "CSF",   "results/MOFA2_CSF_model.hdf5")
+mofa_serum_trained <- train_mofa(serum_mat, "Serum", "results/MOFA2_Serum_model.hdf5")
 
-mofa_csf_trained <- run_mofa(mofa_csf,
-                             outfile = "MOFA2_CSF_model.hdf5",
-                             use_basilisk = TRUE)
+# 6. sensitivity test on number of factors (k = 3-10)
+k_range <- 3:10
+sens_results <- list()
 
-# serum model
-mofa_serum <- create_mofa(list(Serum = serum_mat))
+for (k in k_range) {
+  cat("training csf  k =", k, "...\n")
+  m_csf <- train_mofa(csf_mat, "CSF",
+                       paste0("results/MOFA2_CSF_k", k, ".hdf5"), k = k)
+  r2_csf <- calculate_variance_explained(m_csf)$r2_total[[1]]
 
-data_opts_serum <- get_default_data_options(mofa_serum)
-data_opts_serum$scale_views <- FALSE
+  cat("training serum k =", k, "...\n")
+  m_ser <- train_mofa(serum_mat, "Serum",
+                       paste0("results/MOFA2_Serum_k", k, ".hdf5"), k = k)
+  r2_ser <- calculate_variance_explained(m_ser)$r2_total[[1]]
 
-model_opts_serum <- get_default_model_options(mofa_serum)
-model_opts_serum$num_factors <- 10
+  sens_results[[length(sens_results) + 1]] <- tibble(
+    k = k, tissue = "CSF", total_r2 = r2_csf
+  )
+  sens_results[[length(sens_results) + 1]] <- tibble(
+    k = k, tissue = "Serum", total_r2 = r2_ser
+  )
+}
 
-train_opts_serum <- get_default_training_options(mofa_serum)
-train_opts_serum$convergence_mode <- "slow"
-train_opts_serum$seed <- 42
+sens_df <- bind_rows(sens_results)
 
-mofa_serum <- prepare_mofa(mofa_serum,
-                           data_options = data_opts_serum,
-                           model_options = model_opts_serum,
-                           training_options = train_opts_serum)
+# total variance explained vs number of factors
+p_sens <- ggplot(sens_df, aes(x = k, y = total_r2, colour = tissue)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = k_range) +
+  labs(title = "MOFA2 sensitivity: total variance explained by number of factors",
+       x = "number of factors (k)", y = "total variance explained (R²)",
+       colour = "biofluid") +
+  theme_bw()
 
-mofa_serum_trained <- run_mofa(mofa_serum,
-                               outfile = "MOFA2_Serum_model.hdf5",
-                               use_basilisk = TRUE)
+ggsave("results/MOFA2_factor_sensitivity.pdf", p_sens, width = 8, height = 5)
+cat("\nsensitivity plot saved\n")
 
-
-# section 4: attach metadata to each trained model
-
+# 7. attach metadata to trained models
 meta_clean <- meta |>
   filter(!str_detect(Sample, "PositiveControl|NegativeControl")) |>
   select(Sample, Patient, Tissue, Timepoint, Cohort,
          AIS_Base, AIS_6mo, DeltaTMS, Conversion,
          Segment, Complete_6mo, AIS_Base_Numeric) |>
   mutate(
-    Group = if_else(str_detect(Sample, "Control"), "Control", "SCI"),
+    Group           = if_else(str_detect(Sample, "Control"), "Control", "SCI"),
     Timepoint_label = paste0(Timepoint, "h")
   ) |>
   rename(sample = Sample) |>
@@ -123,76 +136,49 @@ samples_metadata(mofa_csf_trained) <- meta_clean |>
 samples_metadata(mofa_serum_trained) <- meta_clean |>
   filter(sample %in% unlist(samples_names(mofa_serum_trained)))
 
-# section 5: variance decomposition
-# comparison point: paper found timepoint was the dominant source of variation
-
-p_var_csf <- plot_variance_explained(mofa_csf_trained, plot_total = TRUE)
+# 8. variance decomposition
+# paper found timepoint was the dominant source of variation
+p_var_csf   <- plot_variance_explained(mofa_csf_trained,   plot_total = TRUE)
 p_var_serum <- plot_variance_explained(mofa_serum_trained, plot_total = TRUE)
 
-ggsave("MOFA2_variance_csf.pdf", p_var_csf, width = 8, height = 6)
-ggsave("MOFA2_variance_serum.pdf", p_var_serum, width = 8, height = 6)
+ggsave("results/MOFA2_variance_csf.pdf",   p_var_csf,   width = 8, height = 6)
+ggsave("results/MOFA2_variance_serum.pdf", p_var_serum, width = 8, height = 6)
 
-
-# section 6: factor scores coloured by clinical variables
-# replicates the logic of figure 1d in the paper
-
-p_csf_time <- plot_factors(mofa_csf_trained, factors = c(1, 2),
-                           color_by = "Timepoint") +
+# 9. factor scatter plots (cf. fig 1d)
+p_csf_time  <- plot_factors(mofa_csf_trained,   factors = c(1, 2), color_by = "Timepoint") +
   ggtitle("CSF: factor 1 vs 2 by timepoint")
-
-p_csf_ais <- plot_factors(mofa_csf_trained, factors = c(1, 2),
-                          color_by = "AIS_Base") +
+p_csf_ais   <- plot_factors(mofa_csf_trained,   factors = c(1, 2), color_by = "AIS_Base") +
   ggtitle("CSF: factor 1 vs 2 by AIS grade")
-
-p_serum_time <- plot_factors(mofa_serum_trained, factors = c(1, 2),
-                             color_by = "Timepoint") +
+p_serum_time <- plot_factors(mofa_serum_trained, factors = c(1, 2), color_by = "Timepoint") +
   ggtitle("Serum: factor 1 vs 2 by timepoint")
-
-p_serum_ais <- plot_factors(mofa_serum_trained, factors = c(1, 2),
-                            color_by = "AIS_Base") +
+p_serum_ais  <- plot_factors(mofa_serum_trained, factors = c(1, 2), color_by = "AIS_Base") +
   ggtitle("Serum: factor 1 vs 2 by AIS grade")
 
-ggsave("MOFA2_csf_factors_timepoint.pdf", p_csf_time, width = 8, height = 6)
-ggsave("MOFA2_csf_factors_ais.pdf", p_csf_ais, width = 8, height = 6)
-ggsave("MOFA2_serum_factors_timepoint.pdf", p_serum_time, width = 8, height = 6)
-ggsave("MOFA2_serum_factors_ais.pdf", p_serum_ais, width = 8, height = 6)
+ggsave("results/MOFA2_csf_factors_timepoint.pdf",   p_csf_time,  width = 8, height = 6)
+ggsave("results/MOFA2_csf_factors_ais.pdf",         p_csf_ais,   width = 8, height = 6)
+ggsave("results/MOFA2_serum_factors_timepoint.pdf", p_serum_time, width = 8, height = 6)
+ggsave("results/MOFA2_serum_factors_ais.pdf",       p_serum_ais,  width = 8, height = 6)
 
+# 10. factor-covariate correlations
+cov_vars <- c("Timepoint", "AIS_Base_Numeric", "DeltaTMS",
+              "Complete_6mo", "Conversion")
 
-# section 7: factor correlation with clinical covariates
+correlate_factors_with_covariates(mofa_csf_trained,   covariates = cov_vars, plot = "log_pval")
+correlate_factors_with_covariates(mofa_serum_trained, covariates = cov_vars, plot = "log_pval")
 
-correlate_factors_with_covariates(
-  mofa_csf_trained,
-  covariates = c("Timepoint", "AIS_Base_Numeric", "DeltaTMS",
-                 "Complete_6mo", "Conversion"),
-  plot = "log_pval"
-)
-
-correlate_factors_with_covariates(
-  mofa_serum_trained,
-  covariates = c("Timepoint", "AIS_Base_Numeric", "DeltaTMS",
-                 "Complete_6mo", "Conversion"),
-  plot = "log_pval"
-)
-
-
-# section 8: top protein weights per factor
-# compare to paper's top csf biomarkers: GFAP, YWHAH, HSP90AA1, VIM, PRDX1
-# serum biomarkers: LRG1, CRP, SERPINA5, AFM, APMAP
-
+# 11. top protein weights per factor
+# paper's top csf: GFAP, YWHAH, HSP90AA1, VIM, PRDX1
+# paper's top serum: LRG1, CRP, SERPINA5, AFM, APMAP
 for (f in 1:5) {
-  p <- plot_top_weights(mofa_csf_trained, view = "CSF",
-                        factor = f, nfeatures = 15)
-  ggsave(paste0("MOFA2_csf_weights_factor", f, ".pdf"), p, width = 8, height = 5)
-  
-  p <- plot_top_weights(mofa_serum_trained, view = "Serum",
-                        factor = f, nfeatures = 15)
-  ggsave(paste0("MOFA2_serum_weights_factor", f, ".pdf"), p, width = 8, height = 5)
+  p <- plot_top_weights(mofa_csf_trained,   view = "CSF",   factor = f, nfeatures = 15)
+  ggsave(paste0("results/MOFA2_csf_weights_factor", f, ".pdf"),   p, width = 8, height = 5)
+
+  p <- plot_top_weights(mofa_serum_trained, view = "Serum", factor = f, nfeatures = 15)
+  ggsave(paste0("results/MOFA2_serum_weights_factor", f, ".pdf"), p, width = 8, height = 5)
 }
 
-
-# section 9: gfap weight profile
-# gfap was the paper's most robust single biomarker in csf
-
+# 12. gfap deep dive
+# gfap was the paper's most robust single csf biomarker
 csf_weights <- get_weights(mofa_csf_trained, views = "CSF", as.data.frame = TRUE)
 
 gfap_weights <- csf_weights |>
@@ -209,22 +195,11 @@ p_gfap <- gfap_weights |>
        x = "factor", y = "weight") +
   theme_bw()
 
-ggsave("MOFA2_gfap_weights.pdf", p_gfap, width = 6, height = 4)
+ggsave("results/MOFA2_gfap_weights.pdf", p_gfap, width = 6, height = 4)
 
-
-
-
-plot_top_weights(mofa_csf_trained, view = "CSF", factor = 1, nfeatures = 15)
-
-plot_factors(mofa_csf_trained, factors = c(1,2), color_by = "Timepoint")
-
-# section 10: save
-
-saveRDS(mofa_csf_trained, "MOFA2_csf_trained.rds")
-saveRDS(mofa_serum_trained, "MOFA2_serum_trained.rds")
+# 13. save and session info
+saveRDS(mofa_csf_trained,   "results/MOFA2_csf_trained.rds")
+saveRDS(mofa_serum_trained, "results/MOFA2_serum_trained.rds")
 
 cat("\ndone.\n")
 sessionInfo()
-
-
-
