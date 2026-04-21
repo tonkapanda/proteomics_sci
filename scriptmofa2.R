@@ -1,10 +1,10 @@
-# 1. setup
+# MOFA2 analysis
 library(MOFA2)
 library(tidyverse)
 
 dir.create("results", showWarnings = FALSE)
 
-# 2. load data
+# load data
 prot_raw <- read_tsv("human_proteomics.txt")
 meta     <- read_tsv("human_proteomics_meta.txt")
 
@@ -13,7 +13,7 @@ cat("cohorts:",  paste(unique(meta$Cohort),    collapse = ", "), "\n")
 cat("tissues:",  paste(unique(meta$Tissue),    collapse = ", "), "\n")
 cat("timepoints:", paste(sort(unique(meta$Timepoint)), collapse = ", "), "\n")
 
-# 3. long-format join and qc filter
+# long-format join and qc filter
 prot_long <- prot_raw |>
   pivot_longer(-Gene, names_to = "Sample", values_to = "Abundance") |>
   left_join(
@@ -30,8 +30,7 @@ discovery_samples <- meta |>
 prot_discovery <- prot_long |>
   filter(Sample %in% discovery_samples)
 
-# 4. build per-biofluid matrices
-# helper: pivot to proteins x samples matrix
+# build per-biofluid matrices
 make_mat <- function(df, tissue) {
   df |>
     filter(Tissue == tissue) |>
@@ -52,7 +51,7 @@ cat("\nafter missingness filter:\n")
 cat("csf:",   nrow(csf_mat),   "proteins x", ncol(csf_mat),   "samples\n")
 cat("serum:", nrow(serum_mat), "proteins x", ncol(serum_mat), "samples\n")
 
-# 5. train mofa2 models
+# train mofa2 models
 # helper: configure and run a single-view mofa model
 train_mofa <- function(mat, view_name, outfile, k = 10, seed = 42) {
   obj <- create_mofa(setNames(list(mat), view_name))
@@ -79,7 +78,7 @@ train_mofa <- function(mat, view_name, outfile, k = 10, seed = 42) {
 mofa_csf_trained   <- train_mofa(csf_mat,   "CSF",   "results/MOFA2_CSF_model.hdf5")
 mofa_serum_trained <- train_mofa(serum_mat, "Serum", "results/MOFA2_Serum_model.hdf5")
 
-# 6. sensitivity test on number of factors (k = 3-10)
+# sensitivity test on number of factors (k = 3-10)
 k_range <- 3:10
 sens_results <- list()
 
@@ -117,7 +116,7 @@ p_sens <- ggplot(sens_df, aes(x = k, y = total_r2, colour = tissue)) +
 ggsave("results/MOFA2_factor_sensitivity.pdf", p_sens, width = 8, height = 5)
 cat("\nsensitivity plot saved\n")
 
-# 7. attach metadata to trained models
+# attach metadata to trained models
 meta_clean <- meta |>
   filter(!str_detect(Sample, "PositiveControl|NegativeControl")) |>
   select(Sample, Patient, Tissue, Timepoint, Cohort,
@@ -136,15 +135,14 @@ samples_metadata(mofa_csf_trained) <- meta_clean |>
 samples_metadata(mofa_serum_trained) <- meta_clean |>
   filter(sample %in% unlist(samples_names(mofa_serum_trained)))
 
-# 8. variance decomposition
-# paper found timepoint was the dominant source of variation
+# variance decomposition
 p_var_csf   <- plot_variance_explained(mofa_csf_trained,   plot_total = TRUE)
 p_var_serum <- plot_variance_explained(mofa_serum_trained, plot_total = TRUE)
 
 ggsave("results/MOFA2_variance_csf.pdf",   p_var_csf,   width = 8, height = 6)
 ggsave("results/MOFA2_variance_serum.pdf", p_var_serum, width = 8, height = 6)
 
-# 9. factor scatter plots (cf. fig 1d)
+# factor scatter plots (cf. fig 1d)
 p_csf_time  <- plot_factors(mofa_csf_trained,   factors = c(1, 2), color_by = "Timepoint") +
   ggtitle("CSF: factor 1 vs 2 by timepoint")
 p_csf_ais   <- plot_factors(mofa_csf_trained,   factors = c(1, 2), color_by = "AIS_Base") +
@@ -159,14 +157,13 @@ ggsave("results/MOFA2_csf_factors_ais.pdf",         p_csf_ais,   width = 8, heig
 ggsave("results/MOFA2_serum_factors_timepoint.pdf", p_serum_time, width = 8, height = 6)
 ggsave("results/MOFA2_serum_factors_ais.pdf",       p_serum_ais,  width = 8, height = 6)
 
-# 10. factor-covariate correlations
+# factor-covariate correlations
 cov_vars <- c("Timepoint", "AIS_Base_Numeric", "DeltaTMS",
               "Complete_6mo", "Conversion")
 
 correlate_factors_with_covariates(mofa_csf_trained,   covariates = cov_vars, plot = "log_pval")
 correlate_factors_with_covariates(mofa_serum_trained, covariates = cov_vars, plot = "log_pval")
 
-# 11. top protein weights per factor
 # paper's top csf: GFAP, YWHAH, HSP90AA1, VIM, PRDX1
 # paper's top serum: LRG1, CRP, SERPINA5, AFM, APMAP
 for (f in 1:5) {
@@ -177,8 +174,7 @@ for (f in 1:5) {
   ggsave(paste0("results/MOFA2_serum_weights_factor", f, ".pdf"), p, width = 8, height = 5)
 }
 
-# 12. gfap deep dive
-# gfap was the paper's most robust single csf biomarker
+# gfap protein csf biomarker
 csf_weights <- get_weights(mofa_csf_trained, views = "CSF", as.data.frame = TRUE)
 
 gfap_weights <- csf_weights |>
@@ -197,7 +193,7 @@ p_gfap <- gfap_weights |>
 
 ggsave("results/MOFA2_gfap_weights.pdf", p_gfap, width = 6, height = 4)
 
-# 13. save and session info
+# save and session info
 saveRDS(mofa_csf_trained,   "results/MOFA2_csf_trained.rds")
 saveRDS(mofa_serum_trained, "results/MOFA2_serum_trained.rds")
 
